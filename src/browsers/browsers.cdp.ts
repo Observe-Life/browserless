@@ -22,8 +22,11 @@ import StealthPlugin from '@zorilla/puppeteer-extra-plugin-stealth';
 import { addExtra } from '@zorilla/puppeteer-extra';
 import getPort from 'get-port';
 import httpProxy from 'http-proxy';
+import { makeDefaultScreenInfoArg } from '../utils.js';
 import path from 'path';
 import playwright from 'playwright-core';
+
+import { bridgeCDPContexts } from './cdp-context-bridge.js';
 
 // @zorilla/puppeteer-extra's types still expect puppeteer's long-removed
 // createBrowserFetcher and re-declare their own plugin interface; at runtime
@@ -66,12 +69,26 @@ export class ChromiumCDP extends EventEmitter {
   protected blockAds: boolean;
   protected running = false;
   protected browser: Browser | null = null;
+  private closing: Promise<void> | null = null;
   protected browserWSEndpoint: string | null = null;
   protected port?: number;
   protected logger: Logger;
   protected proxy = httpProxy.createProxyServer();
   protected executablePath = playwright.chromium.executablePath();
   protected keepUntilMS = 0;
+  private readonly handleTargetCreated = (target: Target) =>
+    this.onTargetCreated(target);
+  private readonly handleDisconnected = () => {
+    if (!this.running) return;
+    this.logger.warn(
+      `${this.constructor.name} disconnected unexpectedly, emitting close`,
+    );
+    this.emit('close');
+    this.cleanListeners();
+    this.running = false;
+    this.browser = null;
+    this.browserWSEndpoint = null;
+  };
 
   constructor({
     blockAds,
@@ -104,7 +121,10 @@ export class ChromiumCDP extends EventEmitter {
   }
 
   protected cleanListeners() {
-    this.browser?.removeAllListeners();
+    // Puppeteer's no-argument removeAllListeners() disposes the Browser,
+    // starting another close. Detach only listeners owned by this wrapper.
+    this.browser?.off('targetcreated', this.handleTargetCreated);
+    this.browser?.off('disconnected', this.handleDisconnected);
     this.removeAllListeners();
   }
 
@@ -352,18 +372,27 @@ export class ChromiumCDP extends EventEmitter {
   }
 
   public async close(): Promise<void> {
-    if (this.browser) {
+    if (this.closing) return this.closing;
+    const browser = this.browser;
+    if (!browser) return;
+
+    // Publish the shutdown promise before notifying listeners, which may call
+    // close() again and must await the same shutdown before removing files.
+    this.closing = Promise.resolve().then(async () => {
       this.logger.debug(
         `Closing ${this.constructor.name} process and all listeners`,
       );
       this.emit('close');
       this.cleanListeners();
-      this.browser.removeAllListeners();
-      const browser = this.browser;
       this.running = false;
       this.browser = null;
       this.browserWSEndpoint = null;
       await browser.close().catch(() => undefined);
+    });
+    try {
+      await this.closing;
+    } finally {
+      this.closing = null;
     }
   }
 
@@ -420,6 +449,11 @@ export class ChromiumCDP extends EventEmitter {
 
     const finalOptions = {
       ...options,
+      // Application shutdown owns these signals and awaits browser.close().
+      // Puppeteer's handlers would kill Chrome before it flushes its profile.
+      handleSIGTERM: false,
+      handleSIGINT: false,
+      handleSIGHUP: false,
       args: [
         `--remote-debugging-port=${this.port}`,
         `--no-sandbox`,
@@ -430,6 +464,7 @@ export class ChromiumCDP extends EventEmitter {
         // This is needed to allow WebSocket connections to localhost.
         `--disable-features=LocalNetworkAccessChecks`,
         disableComponentUpdaterArg,
+        makeDefaultScreenInfoArg(options),
         ...(options.args || []),
         this.userDataDir ? `--user-data-dir=${this.userDataDir}` : '',
       ].filter((_) => !!_),
@@ -452,29 +487,14 @@ export class ChromiumCDP extends EventEmitter {
       `Launching ${this.constructor.name} Handler`,
     );
     this.browser = (await launch(finalOptions)) as Browser;
-    this.browser.on('targetcreated', this.onTargetCreated.bind(this));
+    this.browser.on('targetcreated', this.handleTargetCreated);
     // Propagate unexpected disconnect (Chrome OOM, segfault, host SIGKILL)
     // as a `close` event on the wrapper. Without this, a spontaneous
     // exit leaves the BrowserlessSession in BrowserManager.browsers
-    // forever and the user-data-dir leaks. The `if (this.running)`
-    // guard skips re-entry during the normal close() path (which sets
-    // running=false before awaiting the inner close).
-    this.browser.once('disconnected', () => {
-      if (this.running) {
-        this.logger.warn(
-          `${this.constructor.name} disconnected unexpectedly, emitting close`,
-        );
-        this.emit('close');
-        this.cleanListeners();
-        // `?.` because `this.emit('close')` above recursively re-enters
-        // wrapper.close() (via BrowserManager's close listener) and nulls
-        // this.browser synchronously before control returns here.
-        this.browser?.removeAllListeners();
-        this.running = false;
-        this.browser = null;
-        this.browserWSEndpoint = null;
-      }
-    });
+    // forever and the user-data-dir leaks. cleanListeners() detaches this
+    // handler on either path. Use on(), since Puppeteer's once() wraps the
+    // callback and cannot be removed with off(originalCallback).
+    this.browser.on('disconnected', this.handleDisconnected);
     this.running = true;
     this.browserWSEndpoint = this.browser.wsEndpoint();
     this.logger.debug(
@@ -530,9 +550,27 @@ export class ChromiumCDP extends EventEmitter {
       ? path.join('/devtools', '/page', this.getPageId(page))
       : req.parsed.pathname;
     const target = new URL(pathname, this.browserWSEndpoint).href;
-    req.url = '';
 
-    // Delete headers known to cause issues
+    const policy = this.config.getCDPContextPolicy(req);
+    if (policy) {
+      try {
+        await bridgeCDPContexts(
+          req,
+          socket,
+          head,
+          target,
+          this,
+          policy,
+          this.config.getCdpMaxInboundPayload(),
+        );
+      } finally {
+        await page?.close().catch(noop);
+      }
+      return;
+    }
+
+    req.url = '';
+    // Only the legacy proxy forwards the incoming request headers.
     delete req.headers.origin;
 
     return new Promise((resolve, reject) => {
@@ -600,6 +638,23 @@ export class ChromiumCDP extends EventEmitter {
     socket: Duplex,
     head: Buffer,
   ): Promise<void> {
+    const policy = this.config.getCDPContextPolicy(req);
+    if (policy) {
+      if (!this.browserWSEndpoint) {
+        throw new ServerError(
+          'No browserWSEndpoint found, did you launch first?',
+        );
+      }
+      return bridgeCDPContexts(
+        req,
+        socket,
+        head,
+        this.browserWSEndpoint,
+        this,
+        policy,
+        this.config.getCdpMaxInboundPayload(),
+      );
+    }
     return new Promise((resolve, reject) => {
       if (!this.browserWSEndpoint) {
         throw new ServerError(

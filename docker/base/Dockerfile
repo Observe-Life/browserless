@@ -1,4 +1,6 @@
-FROM ubuntu:26.04
+# Resolute is Ubuntu 26.04. Its codename keeps Dependabot digest refreshes enabled
+# even when digest-only updates for numeric version tags are suppressed.
+FROM ubuntu:resolute@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c
 
 LABEL org.opencontainers.image.source=https://github.com/browserless/browserless
 
@@ -10,8 +12,8 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG TZ=America/Los_Angeles
 ARG BLESS_USER_ID=999
 ARG APP_DIR=/usr/src/app
-ARG NODE_VERSION=v24.21.0
-ARG NPM_VERSION=11.19.1
+ARG NODE_VERSION=v26.13.0
+ARG NPM_VERSION=11.21.2
 
 ENV NODE_VERSION=$NODE_VERSION
 ENV NVM_DIR=/usr/src/.nvm
@@ -46,10 +48,13 @@ RUN if [ -n "${APT_MIRROR}" ]; then \
   fi
 
 RUN apt-get update \
+  && apt-get upgrade -y --no-install-recommends \
   && apt-get install -y --no-install-recommends \
   ca-certificates \
   curl \
   dumb-init \
+  # Official Node.js >= 25 Linux binaries link against libatomic
+  libatomic1 \
   unzip \
   wget \
   xvfb \
@@ -73,7 +78,11 @@ RUN apt-get update \
   && fc-cache -f -v \
   && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* /usr/share/fonts/truetype/noto
 
-RUN curl -sL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.7/install.sh | bash &&\
+# nvm v0.41.0: keep the installer and its payloads on the same immutable commit.
+RUN curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/4e8758a801eea9479b32a904f31093e410ddaba4/install.sh -o /tmp/nvm-install.sh &&\
+  echo '045932fe05f0d4247c946f2ec0ec4026dbfd8ce88a5f67ea28d8ea833227f48b  /tmp/nvm-install.sh' | sha256sum -c - &&\
+  NVM_INSTALL_VERSION=4e8758a801eea9479b32a904f31093e410ddaba4 bash /tmp/nvm-install.sh &&\
+  rm /tmp/nvm-install.sh &&\
   . $NVM_DIR/nvm.sh &&\
   nvm install $NODE_VERSION &&\
   npm install -g npm@$NPM_VERSION
@@ -93,6 +102,8 @@ COPY extensions extensions
 COPY external external
 COPY scripts scripts
 COPY static static
+
+RUN node scripts/install-playwright-ffmpeg.js
 
 COPY CHANGELOG.md LICENSE NOTICE.txt README.md tsconfig.json ./
 

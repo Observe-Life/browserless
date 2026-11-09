@@ -2,6 +2,7 @@ import { expect } from 'chai';
 import {
   Config,
   Logger,
+  Request,
   browserlessChromiumDisabledFeatures,
   findBlockedUrlInMessage,
   normalizeUrlForBlocklist,
@@ -20,6 +21,7 @@ import { createServer, IncomingMessage, Server } from 'http';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { chromium } from 'playwright-core';
 
 /** Poll `cond` every 10ms up to `timeoutMs`; replaces brittle fixed sleeps. */
 const waitFor = async (
@@ -333,6 +335,7 @@ describe('BasePlaywright URL filter', () => {
     let bridgePort: number;
     let playwright: ChromiumPlaywright;
     let upstreamCloseReasons: number[];
+    let config: Config;
 
     beforeEach(async () => {
       upstreamMessages = [];
@@ -357,7 +360,7 @@ describe('BasePlaywright URL filter', () => {
       });
 
       // 2. ChromiumPlaywright wired to point at the fake upstream.
-      const config = new Config();
+      config = new Config();
       config.setAllowFileProtocol(false);
       playwright = new ChromiumPlaywright({
         config,
@@ -398,6 +401,367 @@ describe('BasePlaywright URL filter', () => {
         fakeUpstreamServer.close(() => resolve()),
       );
       await new Promise<void>((resolve) => bridgeServer.close(() => resolve()));
+    });
+
+    for (const method of ['newContext', 'newContextForReuse', 'send']) {
+      it(`keeps ${method} admission scoped to each connection request`, async () => {
+        const observed: unknown[] = [];
+        const origins: unknown[] = [];
+        fakeUpstreamServer.on('connection', (_ws, req) => {
+          origins.push(req.headers.origin);
+        });
+        const check = async (req?: Request) => {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          observed.push([req?.url, req?.headers.origin]);
+          if (req?.parsed.pathname !== '/allowed') throw new Error('denied');
+        };
+        Object.assign(config, {
+          preparePlaywrightContextOptions: (_options: unknown, req?: Request) =>
+            check(req),
+          getCDPContextPolicy: (req?: Request) => () => check(req),
+        });
+        const denied = new WebSocket(`ws://127.0.0.1:${bridgePort}/denied`, {
+          origin: 'https://denied.example',
+        });
+        const allowed = new WebSocket(`ws://127.0.0.1:${bridgePort}/allowed`, {
+          origin: 'https://allowed.example',
+        });
+        await Promise.all(
+          [denied, allowed].map(
+            (client) =>
+              new Promise<void>((resolve) => client.once('open', resolve)),
+          ),
+        );
+        try {
+          const closed = new Promise<number>((resolve) =>
+            denied.once('close', resolve),
+          );
+          const params =
+            method === 'send'
+              ? { method: 'Target.createBrowserContext', params: {} }
+              : {};
+          denied.send(JSON.stringify({ id: 1, method, params }));
+          expect(await closed).to.equal(1008);
+          allowed.send(JSON.stringify({ id: 2, method, params }));
+          await waitFor(() => upstreamMessages.length === 1);
+          expect(JSON.parse(upstreamMessages[0]).id).to.equal(2);
+          expect(observed).to.deep.equal([
+            ['/denied', 'https://denied.example'],
+            ['/allowed', 'https://allowed.example'],
+          ]);
+          expect(origins).to.deep.equal([undefined, undefined]);
+        } finally {
+          denied.terminate();
+          allowed.terminate();
+        }
+      });
+    }
+
+    it('enforces context admission through a real launchServer CDP session', async function () {
+      if (!fs.existsSync(chromium.executablePath())) this.skip();
+      let hits = 0;
+      const proxy = net.createServer((socket) => {
+        hits++;
+        socket.destroy();
+      });
+      const server = await chromium.launchServer({
+        executablePath: chromium.executablePath(),
+        headless: true,
+        args: ['--no-sandbox'],
+      });
+      await new Promise<void>((resolve) =>
+        proxy.listen(0, '127.0.0.1', resolve),
+      );
+      Object.assign(playwright, {
+        browserWSEndpoint: server.wsEndpoint(),
+        browser: server,
+      });
+      Object.assign(config, {
+        getCDPContextPolicy: () => async (options: Record<string, unknown>) => {
+          if (String(options.proxyServer).includes('127.0.0.1'))
+            throw new Error('denied');
+        },
+      });
+      const browser = await chromium.connect(`ws://127.0.0.1:${bridgePort}/`);
+      const sibling = await chromium.connect(`ws://127.0.0.1:${bridgePort}/`);
+      try {
+        const siblingCDP = await sibling.newBrowserCDPSession();
+        const cdp = await browser.newBrowserCDPSession();
+        expect((await cdp.send('Browser.getVersion')).product).to.contain(
+          'Chrome',
+        );
+        let rejected = false;
+        let contextId: string | undefined;
+        try {
+          const { browserContextId } = await cdp.send(
+            'Target.createBrowserContext',
+            {
+              proxyServer: `http://127.0.0.1:${(proxy.address() as AddressInfo).port}`,
+            },
+          );
+          contextId = browserContextId;
+        } catch {
+          rejected = true;
+        }
+        if (contextId) {
+          await cdp.send('Target.createTarget', {
+            url: 'http://fixture.invalid/',
+            browserContextId: contextId,
+          });
+          await waitFor(() => hits > 0);
+        }
+        expect(rejected, 'private context must be denied').to.equal(true);
+        expect(hits, 'private proxy must receive no connection').to.equal(0);
+        // Allow the rejected connection's bounded close drain to finish.
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        expect(
+          (await siblingCDP.send('Browser.getVersion')).product,
+        ).to.contain('Chrome');
+      } finally {
+        await browser.close();
+        await sibling.close();
+        await server.close();
+        await new Promise<void>((resolve) => proxy.close(() => resolve()));
+      }
+    });
+
+    for (const method of [
+      'Target.createBrowserContext',
+      'Target.exposeDevToolsProtocol',
+    ]) {
+      it(`rejects nested ${method} inside the Playwright send channel`, async () => {
+        Object.assign(config, {
+          getCDPContextPolicy: () => async () => {
+            throw new Error('denied');
+          },
+        });
+        const client = new WebSocket(`ws://127.0.0.1:${bridgePort}/`);
+        await new Promise<void>((resolve) => client.once('open', resolve));
+        const closed = new Promise<void>((resolve) =>
+          client.once('close', () => resolve()),
+        );
+        client.send(
+          JSON.stringify({
+            id: 1,
+            method: 'send',
+            params: {
+              method: 'Target.sendMessageToTarget',
+              params: {
+                sessionId: 'child',
+                message: JSON.stringify({
+                  id: 2,
+                  method,
+                  params:
+                    method === 'Target.createBrowserContext'
+                      ? { proxyServer: 'direct://' }
+                      : { targetId: 'page' },
+                }),
+              },
+            },
+          }),
+        );
+        try {
+          await Promise.race([
+            closed,
+            waitFor(() => upstreamMessages.length > 0),
+          ]);
+          expect(upstreamMessages).to.deep.equal([]);
+        } finally {
+          client.terminate();
+        }
+      });
+    }
+
+    it('preserves large immediate and queued payloads while awaiting context policy and normalizing options', async () => {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      Object.assign(config, {
+        async preparePlaywrightContextOptions(options: {
+          proxy?: { server: string; bypass?: string };
+        }) {
+          await gate;
+          if (options.proxy) {
+            options.proxy.server = 'http://203.0.113.19:8080';
+            options.proxy.bypass = '<-loopback>';
+          }
+        },
+      });
+      const client = new WebSocket(`ws://127.0.0.1:${bridgePort}/`);
+      await new Promise<void>((resolve) => client.once('open', resolve));
+      try {
+        client.send(JSON.stringify({ id: 0, method: 'ready' }));
+        await waitFor(() => upstreamMessages.length === 1);
+        upstreamMessages.length = 0;
+        const immediatePayload = 'a'.repeat(1024 * 1024);
+        const queuedPayload = 'b'.repeat(1024 * 1024);
+        client.send(
+          JSON.stringify({
+            id: 1,
+            method: 'newContext',
+            params: {
+              proxy: { server: 'http://proxy.example:8080', bypass: '*' },
+              payload: immediatePayload,
+            },
+          }),
+        );
+        client.send(
+          JSON.stringify({
+            id: 2,
+            method: 'goto',
+            params: { url: 'https://example.com', payload: queuedPayload },
+          }),
+        );
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(upstreamMessages).to.deep.equal([]);
+        release();
+        await waitFor(() => upstreamMessages.length === 2);
+        expect(
+          upstreamMessages.map((message) => JSON.parse(message).id),
+        ).to.deep.equal([1, 2]);
+        expect(JSON.parse(upstreamMessages[0]).params.proxy).to.deep.equal({
+          server: 'http://203.0.113.19:8080',
+          bypass: '<-loopback>',
+        });
+        expect(JSON.parse(upstreamMessages[0]).params.payload).to.equal(
+          immediatePayload,
+        );
+        expect(JSON.parse(upstreamMessages[1]).params.payload).to.equal(
+          queuedPayload,
+        );
+      } finally {
+        release();
+        client.close();
+      }
+    });
+
+    for (const method of ['newContext', 'newContextForReuse']) {
+      it(`does not forward a rejected ${method} or frames queued behind it`, async () => {
+        Object.assign(config, {
+          async preparePlaywrightContextOptions() {
+            throw new Error('context policy rejected');
+          },
+        });
+        const client = new WebSocket(`ws://127.0.0.1:${bridgePort}/`);
+        await new Promise<void>((resolve) => client.once('open', resolve));
+        const closed = new Promise<number>((resolve) =>
+          client.once('close', resolve),
+        );
+        client.send(
+          JSON.stringify({
+            id: 1,
+            method,
+            params: { proxy: { server: 'http://127.0.0.1:9999' } },
+          }),
+        );
+        client.send(
+          JSON.stringify({
+            id: 2,
+            method: 'goto',
+            params: { url: 'https://example.com' },
+          }),
+        );
+        // Bound failure so an absent policy cannot leave the fixture sockets open.
+        await Promise.race([
+          closed,
+          new Promise((resolve) => setTimeout(resolve, 100)),
+        ]);
+        client.close();
+        expect(await closed).to.equal(1008);
+        expect(upstreamMessages).to.deep.equal([]);
+      });
+    }
+
+    for (const termination of ['disconnect', 'overflow', 'byte overflow']) {
+      it(`does not forward buffered frames after ${termination} during context policy`, async () => {
+        let release!: () => void;
+        let entered!: () => void;
+        const gate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const checking = new Promise<void>((resolve) => {
+          entered = resolve;
+        });
+        Object.assign(config, {
+          async preparePlaywrightContextOptions() {
+            entered();
+            await gate;
+          },
+        });
+        const client = new WebSocket(`ws://127.0.0.1:${bridgePort}/`);
+        await new Promise<void>((resolve) => client.once('open', resolve));
+        const sibling = new WebSocket(`ws://127.0.0.1:${bridgePort}/`);
+        await new Promise<void>((resolve) => sibling.once('open', resolve));
+        const closed = new Promise<number>((resolve) =>
+          client.once('close', resolve),
+        );
+        const deadline = setTimeout(() => client.close(), 5000);
+        try {
+          client.send(
+            JSON.stringify({ id: 1, method: 'newContext', params: {} }),
+          );
+          await checking;
+          if (termination !== 'disconnect') {
+            const count = termination === 'overflow' ? 257 : 2;
+            const params =
+              termination === 'byte overflow'
+                ? { data: 'a'.repeat(60 * 1024 * 1024) }
+                : {};
+            for (let id = 2; id < count + 2; id++) {
+              client.send(JSON.stringify({ id, method: 'noop', params }));
+            }
+            expect(await closed).to.equal(1009);
+          } else {
+            client.close();
+            await closed;
+          }
+          release();
+          await new Promise((resolve) => setTimeout(resolve, 600));
+          expect(upstreamMessages).to.deep.equal([]);
+          sibling.send(JSON.stringify({ id: 999, method: 'ping' }));
+          await waitFor(() => upstreamMessages.length === 1);
+          expect(JSON.parse(upstreamMessages[0]).id).to.equal(999);
+        } finally {
+          clearTimeout(deadline);
+          release();
+          client.close();
+          sibling.close();
+        }
+      });
+    }
+
+    it('preserves context options under the default policy', async () => {
+      const client = new WebSocket(`ws://127.0.0.1:${bridgePort}/`);
+      await new Promise<void>((resolve) => client.once('open', resolve));
+      const message = {
+        id: 1,
+        method: 'newContext',
+        params: {
+          proxy: {
+            server: 'http://127.0.0.1:8080',
+            bypass: '*.example.com',
+            username: 'example-user',
+            password: 'example-password',
+          },
+          locale: 'fr-FR',
+          viewport: { width: 900, height: 600 },
+        },
+      };
+      const wireMessage = JSON.stringify(message, null, 2);
+      try {
+        client.send(wireMessage);
+        await waitFor(() => upstreamMessages.length === 1);
+        expect(upstreamMessages[0]).to.equal(wireMessage);
+        for (let id = 2; id < 602; id++)
+          client.send(JSON.stringify({ ...message, id }));
+        await waitFor(() => upstreamMessages.length === 601);
+        expect(
+          upstreamMessages.map((frame) => JSON.parse(frame).id),
+        ).to.deep.equal(Array.from({ length: 601 }, (_, i) => i + 1));
+      } finally {
+        client.close();
+      }
     });
 
     it('forwards a benign Frame.goto to the upstream', async () => {
@@ -980,6 +1344,43 @@ describe('BasePlaywright --disable-features merging (issue #5450)', () => {
   });
 
   describe('makeLaunchOptions', () => {
+    it('defaults the Chromium screen without overriding caller screens', () => {
+      expect(launchArgs(ChromiumPlaywright, [])).to.include(
+        '--screen-info={1920x1080}',
+      );
+      expect(
+        launchArgs(ChromiumPlaywright, ['--window-size=2560,1440']),
+      ).to.include('--screen-info={2560x1440}');
+      expect(
+        launchArgs(ChromiumPlaywright, ['--screen-info={800x600}']).filter(
+          (arg) => arg.startsWith('--screen-info'),
+        ),
+      ).to.deep.equal(['--screen-info={800x600}']);
+    });
+
+    it('does not set a screen for headful Chromium', () => {
+      const browser = new ChromiumPlaywright({
+        config: new Config(),
+        logger: new Logger('test'),
+        userDataDir: null,
+      });
+      const { args } = (browser as unknown as Launchable).makeLaunchOptions({
+        args: [],
+        headless: false,
+      });
+      expect(args.filter((arg) => arg.startsWith('--screen-info'))).to.be.empty;
+    });
+
+    it('does not add Chromium screen flags to Firefox or WebKit', () => {
+      for (const Ctor of [FirefoxPlaywright, WebKitPlaywright]) {
+        expect(
+          launchArgs(Ctor as unknown as PwCtor, []).filter((arg) =>
+            arg.startsWith('--screen-info'),
+          ),
+        ).to.be.empty;
+      }
+    });
+
     it('Chromium emits a single merged --disable-features with both lists', () => {
       const args = launchArgs(ChromiumPlaywright, []);
       expect(disableFeaturesFlags(args)).to.have.lengthOf(1);
