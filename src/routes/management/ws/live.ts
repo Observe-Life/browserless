@@ -198,6 +198,11 @@ export default class LiveNavWebSocketRoute extends WebSocketRoute {
         return;
       }
       if (PAGE_METHODS.has(method)) {
+        if (typeof msg.id !== 'string') {
+          return client.send(
+            JSON.stringify({ t: 'error', message: 'Page commands require an id.' }),
+          );
+        }
         if (!state.watcher || state.watcher.ws.readyState !== WebSocket.OPEN) {
           return client.send(
             JSON.stringify({
