@@ -98,7 +98,7 @@ export default class LiveNavWebSocketRoute extends WebSocketRoute {
   ): Promise<void> {
     const wss = new WebSocketServer({ noServer: true });
     const client: WebSocket = await new Promise((resolve) =>
-      wss.handleUpgrade(req, socket, head, (ws) => resolve(ws)),
+      wss.handleUpgrade(_req, socket, head, (ws) => resolve(ws)),
     );
 
     let entry: UpstreamEntry;
