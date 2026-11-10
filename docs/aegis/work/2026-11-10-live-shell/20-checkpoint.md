@@ -1,7 +1,21 @@
-# 检查点 2026-11-10
-- 状态：进行中（任务地图 6 步，现处 T1/T2）
-- 已完成：fork+双分支+默认分支+Actions 启用；计划与意图落库
-- 任务地图：T1 路由机制 → T2 实例发现 → T3 转发层 → T4 壳页面 → T5 云构建 → T6 部署验收
-- 当前分支：v2.59.0-customize（基线 52d38b2）
-- 阻塞：无
-- 下一步：读 router.ts / browser-manager.ts 关键代码，消除 T1/T2 两个未知
+# 检查点 2026-11-10（更新）
+
+- 状态：进行中（T5 云构建执行中）
+- 任务地图：T1 ✅ → T2 ✅ → T3 ✅ → T4 ✅ → T5 进行中 → T6 待做
+- 当前分支：v2.59.0-customize（HEAD 6b9eb8c0 + ci 修正提交）
+- 已完成：
+  - T1 路由机制：routes/*/ws|http 目录扫描自动发现（utils.ts getRouteFiles）；auth=false 在非 STRICT 模式下免鉴权（token.ts isAuthorized）；WebSocketRoute 基类 handler(req,socket,head,logger) 无需浏览器
+  - T2 实例发现：getAllSessions() 的 browserId === wsEndpoint 末段 GUID（browsers/index.ts:840）；/devtools/browser/<GUID> 走 reconnectionPatterns 附着已有实例不启动新的（browsers/index.ts:633-650）；无实例时连 /chromium 拉起（连接断开即回收=browserless 模型）
+  - T3 转发层 src/routes/management/ws/live.ts：单 upstream 多 client 共享 + 30s 宽限；命令 id 全局重映射；白名单双清单（browser 7 项/page 16 项）；Runtime.evaluate 类全拒
+  - T4 壳页面 src/routes/management/http/nav.get.ts：标签栏（实时事件驱动）+ 网址栏 + 加号 + 只读/接管 + contain 缩放画面 + 触屏映射；内嵌 JS 语法预检通过（debug-anything node --check）
+  - T5 workflow：v1 失败（ghcr.io/browserless/base:v26.13.0 不公开）→ v2 自建 base 层（官方 docker-chromium.yml 同款两步构建）运行中
+- 关键决策记录：
+  - 旁观附着优于每连接隔离：壳显示智能体实例的标签页（用户核心场景）
+  - 命令白名单是免鉴权的代价边界（红线：任何能执行 JS 的方法不进清单）
+  - path 用字面量 ['/live'] ['/nav']，零挂载补丁（比计划中预估的 ≤5 行补丁更优）
+- 阻塞：无（构建等待中）
+- 下一步：构建绿 → 拉镜像部署（compose 仅改 image 行）→ debug-anything 跑 live-acceptance.mjs 六项验收 → 手机 360px 人工验收（04 判据五条）
+- 踩过的坑：
+  - gh api -f 传布尔值会 422（须用 -F）
+  - fork 不复制 tags（fetch upstream tag 单独推）
+  - PAGE_HTML 内嵌 JS 的正则 `\\/` 转义链：TS 模板串 → JS 运行时，预检需模拟转义后再 node --check
