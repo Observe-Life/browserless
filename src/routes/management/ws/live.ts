@@ -77,6 +77,7 @@ interface UpstreamEntry {
   graceTimer: NodeJS.Timeout | null;
   seq: number;
   replies: Map<number, { client: WebSocket; replyId?: string; s?: string }>;
+  sendQueue: string[];
 }
 
 const upstreams = new Map<string, UpstreamEntry>();
@@ -189,6 +190,9 @@ export default class LiveNavWebSocketRoute extends WebSocketRoute {
       }
       if (entry.ws.readyState === WebSocket.OPEN) {
         entry.ws.send(JSON.stringify(payload));
+      } else {
+        // Upstream still connecting (spawn path): buffer and flush on open.
+        entry.sendQueue.push(JSON.stringify(payload));
       }
     });
   }
@@ -243,10 +247,15 @@ function makeUpstream(key: string, spawned: boolean, logger: Logger) {
     graceTimer: null,
     seq: 0,
     replies: new Map(),
+    sendQueue: [],
   };
 
   ws.on('open', () => {
     logger.warn(`[live-nav] upstream open: ${key}`);
+    for (const queued of entry.sendQueue) {
+      ws.send(queued);
+    }
+    entry.sendQueue = [];
     for (const c of entry.clients) {
       c.send(JSON.stringify({ t: 'up', spawned, key }));
     }
