@@ -70,6 +70,8 @@ interface Watcher {
 interface ClientState {
   ws: WebSocket;
   watcher: Watcher | null;
+  watcherSeq: number;
+  watcherReplies: Map<number, string>;
 }
 
 interface UpstreamEntry {
@@ -120,7 +122,12 @@ export default class LiveNavWebSocketRoute extends WebSocketRoute {
       return;
     }
 
-    const state: ClientState = { ws: client, watcher: null };
+    const state: ClientState = {
+      ws: client,
+      watcher: null,
+      watcherSeq: 0,
+      watcherReplies: new Map(),
+    };
     entry.clients.add(state);
     if (entry.graceTimer) {
       clearTimeout(entry.graceTimer);
@@ -199,8 +206,11 @@ export default class LiveNavWebSocketRoute extends WebSocketRoute {
             }),
           );
         }
+        // CDP requires integer ids; remap the client's string id here.
+        const seq = ++state.watcherSeq;
+        state.watcherReplies.set(seq, msg.id);
         return state.watcher.ws.send(
-          JSON.stringify({ id: msg.id, method, params: msg.m.params ?? {} }),
+          JSON.stringify({ id: seq, method, params: msg.m.params ?? {} }),
         );
       }
       return client.send(
@@ -226,6 +236,7 @@ export default class LiveNavWebSocketRoute extends WebSocketRoute {
     const ws = new WebSocket(url, { maxPayload: 256 * 1024 * 1024 });
     const watcher: Watcher = { ws, targetId };
     state.watcher = watcher;
+    state.watcherReplies.clear();
 
     ws.on('open', () => {
       logger.warn(`[live-nav] watcher open for ${targetId}`);
@@ -241,8 +252,15 @@ export default class LiveNavWebSocketRoute extends WebSocketRoute {
       } catch {
         return;
       }
-      // Page-level responses carry the client's own ids verbatim; events
-      // (screencast frames etc.) belong to this watcher only.
+      // Remap numeric ids back to the client's original ids; events pass
+      // through untouched and belong to this watcher only.
+      if (parsed.id !== undefined && state.watcherReplies.has(Number(parsed.id))) {
+        const origId = state.watcherReplies.get(Number(parsed.id))!;
+        state.watcherReplies.delete(Number(parsed.id));
+        return state.ws.send(
+          JSON.stringify({ t: 'e', m: { id: origId, result: (parsed as any).result, error: (parsed as any).error } }),
+        );
+      }
       state.ws.send(JSON.stringify({ t: 'e', m: parsed }));
     });
     ws.on('close', () => {
