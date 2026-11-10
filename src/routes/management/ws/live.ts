@@ -56,11 +56,12 @@ const PAGE_METHODS = new Set<string>([
   'Network.enable',
 ]);
 
-// How long a live relay lingers after its last shell disconnects. For spawned
-// instances this is the window to hit refresh without losing your tabs; after
-// it elapses the upstream connection closes and browserless reclaims the
-// browser. Attached (agent-owned) instances are unaffected either way.
-const GRACE_MS = 30_000;
+// Live relay model (user decision 2026-11-10): the spawned browser is a
+// PERSISTENT service — it outlives shell disconnections entirely. The relay
+// keeps exactly one upstream per key and reconnects it automatically if the
+// transport drops (tabs are lost on such a respawn, which only happens when
+// the browserless service itself restarts or the process is reclaimed).
+// Reclaim happens ONLY when the user stops the container.
 
 interface Watcher {
   ws: WebSocket;
@@ -79,12 +80,11 @@ interface UpstreamEntry {
   ws: WebSocket;
   spawned: boolean;
   clients: Set<ClientState>;
-  graceTimer: NodeJS.Timeout | null;
   seq: number;
+  retryCount?: number;
   replies: Map<number, { client: ClientState; replyId?: string }>;
   sendQueue: string[];
 }
-
 const upstreams = new Map<string, UpstreamEntry>();
 
 export default class LiveNavWebSocketRoute extends WebSocketRoute {
@@ -129,10 +129,6 @@ export default class LiveNavWebSocketRoute extends WebSocketRoute {
       watcherReplies: new Map(),
     };
     entry.clients.add(state);
-    if (entry.graceTimer) {
-      clearTimeout(entry.graceTimer);
-      entry.graceTimer = null;
-    }
 
     client.send(
       JSON.stringify({
@@ -145,16 +141,8 @@ export default class LiveNavWebSocketRoute extends WebSocketRoute {
     const dropClient = () => {
       entry.clients.delete(state);
       this.closeWatcher(state, logger);
-      if (entry.clients.size === 0 && !entry.graceTimer) {
-        entry.graceTimer = setTimeout(() => {
-          entry.graceTimer = null;
-          if (entry.clients.size === 0) {
-            logger.warn(`[live-nav] releasing upstream ${entry.key}`);
-            teardown(entry);
-          }
-        }, GRACE_MS);
-        entry.graceTimer.unref?.();
-      }
+      // Persistent model: no grace timer, no reclaim — the upstream stays
+      // connected (and auto-reconnects) regardless of client count.
     };
 
     client.on('close', dropClient);
@@ -334,12 +322,10 @@ function makeUpstream(key: string, spawned: boolean, logger: Logger) {
     ws,
     spawned,
     clients: new Set(),
-    graceTimer: null,
     seq: 0,
     replies: new Map(),
     sendQueue: [],
   };
-
   ws.on('open', () => {
     logger.warn(`[live-nav] upstream open: ${key}`);
     for (const queued of entry.sendQueue) {
@@ -395,26 +381,32 @@ function makeUpstream(key: string, spawned: boolean, logger: Logger) {
     for (const c of entry.clients) {
       if (c.ws.readyState === WebSocket.OPEN) {
         c.ws.send(JSON.stringify({ t: 'upClosed' }));
-        c.ws.close(1012, 'upstream-closed');
       }
     }
     upstreams.delete(key);
     entry.replies.clear();
-    if (entry.graceTimer) {
-      clearTimeout(entry.graceTimer);
-      entry.graceTimer = null;
+    if (entry.spawned) {
+      // Persistent model: the shell browser must survive transport drops and
+      // client departures. Respawn after a short backoff (tabs are lost in
+      // this path — it only triggers on service restart / process reclaim).
+      entry.retryCount = (entry.retryCount || 0) + 1;
+      if (entry.retryCount <= 5) {
+        const delay = Math.min(2000 * entry.retryCount, 10000);
+        setTimeout(() => {
+          const fresh = makeUpstream(key, true, logger);
+          fresh.retryCount = entry.retryCount;
+          upstreams.set(key, fresh);
+          // hand surviving clients over to the fresh upstream
+          for (const c of entry.clients) fresh.clients.add(c);
+          logger.warn(`[live-nav] respawned upstream ${key} (attempt ${entry.retryCount})`);
+        }, delay);
+      } else {
+        logger.error(`[live-nav] giving up respawn after 5 attempts for ${key}`);
+      }
     }
   });
 
   ws.on('error', (err) => logger.error(`[live-nav] upstream error: ${err}`));
 
   return entry;
-}
-
-function teardown(entry: UpstreamEntry) {
-  if (entry.ws.readyState === WebSocket.OPEN) {
-    entry.ws.close(1000, 'shell-empty');
-  } else {
-    entry.ws.terminate();
-  }
 }

@@ -101,6 +101,11 @@ const PAGE_HTML = `<!doctype html>
     background: rgba(0,0,0,.55); color: #e8eaed;
   }
   #badge.control { background: rgba(26,115,232,.85); color: #fff; }
+  #ptr {
+    position: absolute; width: 14px; height: 14px; border-radius: 50%;
+    background: rgba(26,115,232,.75); border: 2px solid #fff;
+    z-index: 7; pointer-events: none; opacity: 0; transition: opacity .3s;
+  }
 </style>
 </head>
 <body>
@@ -115,6 +120,7 @@ const PAGE_HTML = `<!doctype html>
     <canvas id="view"></canvas>
     <div id="msg"><span id="msgText">正在连接浏览器…</span></div>
     <div id="badge" class="hidden">只读</div>
+    <div id="ptr"></div>
   </div>
 <script>
 (function () {
@@ -125,6 +131,7 @@ const PAGE_HTML = `<!doctype html>
   var control = false;
   var spawned = null;          // null | true | false
   var seq = 1, pending = {};   // cmdId -> fn(reply)
+  var heart = null, ptrT = null;
   var scale = 1, offX = 0, offY = 0;
   var haveFrame = false;
 
@@ -158,8 +165,9 @@ const PAGE_HTML = `<!doctype html>
     setState('连接中…');
     try { ws = new WebSocket(proto + location.host + '/live'); }
     catch (e) { wsTimer = setTimeout(connect, 2000); return; }
-    ws.onopen = function () { setMsg(''); ensure(); };
+    ws.onopen = function () { setMsg(''); ensure(); heart = setInterval(function () { try { ws.send(JSON.stringify({ t: 'ping' })); } catch (e) {} }, 25000); };
     ws.onclose = function () {
+      clearInterval(heart);
       targets = {}; watchTarget = null; haveFrame = false;
       setMsg('与浏览器的连接已断开，正在重连…');
       setState('已断开');
@@ -173,6 +181,7 @@ const PAGE_HTML = `<!doctype html>
         setState(spawned ? '已连接（独立实例）' : '已连接（旁观智能体实例）');
       } else if (d.t === 'watching') {
         watchTarget = d.targetId;
+        send('Emulation.setDeviceMetricsOverride', { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false });
         startCast();
       } else if (d.t === 'watchClosed') {
         if (watchTarget === d.targetId) { watchTarget = null; haveFrame = false; setMsg('该标签页已关闭'); }
@@ -345,7 +354,17 @@ const PAGE_HTML = `<!doctype html>
     send(method, params);
   }
 
+  function ptrAt(e) {
+    if (!control) return;
+    var st = document.getElementById('stage').getBoundingClientRect();
+    elPtr.style.left = (e.clientX - st.left) + 'px';
+    elPtr.style.top = (e.clientY - st.top) + 'px';
+    elPtr.style.opacity = '1';
+    clearTimeout(ptrT); ptrT = setTimeout(function () { elPtr.style.opacity = '0'; }, 700);
+  }
+
   elCanvas.addEventListener('mousedown', function (e) {
+    ptrAt(e);
     var p = toDev(e);
     input('Input.dispatchMouseEvent', { type: 'mousePressed', x: p.x, y: p.y, button: 'left', clickCount: 1, buttons: 1 });
   });
@@ -355,6 +374,7 @@ const PAGE_HTML = `<!doctype html>
   });
   elCanvas.addEventListener('mousemove', function (e) {
     if (!control) return;
+    ptrAt(e);
     var p = toDev(e);
     send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: p.x, y: p.y, buttons: e.buttons || 0 });
   });
@@ -366,6 +386,7 @@ const PAGE_HTML = `<!doctype html>
 
   var touchStart = null;
   elCanvas.addEventListener('touchstart', function (e) {
+    ptrAt(e.touches[0]);
     var t = e.touches[0]; touchStart = { x: t.clientX, y: t.clientY, moved: false };
     var p = toDev(t);
     input('Input.dispatchMouseEvent', { type: 'mousePressed', x: p.x, y: p.y, button: 'left', clickCount: 1, buttons: 1 });
