@@ -431,7 +431,7 @@ export default class LiveNavGetRoute extends HTTPRoute {
   method = Methods.get;
   path = ['/nav', '/nav/'];
   tags = [APITags.management];
-  async handler(req: Request, res: ServerResponse): Promise<void> {
+  async handler(_req: Request, res: ServerResponse): Promise<void> {
     return writeResponse(res, 200, PAGE_HTML, contentTypes.html);
   }
 }

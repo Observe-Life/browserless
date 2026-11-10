@@ -91,7 +91,7 @@ export default class LiveNavWebSocketRoute extends WebSocketRoute {
   tags = [APITags.management];
 
   async handler(
-    req: Request,
+    _req: Request,
     socket: Duplex,
     head: Buffer,
     logger: Logger,
