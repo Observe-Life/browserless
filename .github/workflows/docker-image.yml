@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -47,3 +47,17 @@ jobs:
         run: |
           docker push ghcr.io/observe-life/browserless-chromium:v2.59.0-live
           docker push ghcr.io/observe-life/browserless-chromium:latest
+
+      - name: Save image archive (fallback delivery)
+        run: |
+          docker save ghcr.io/observe-life/browserless-chromium:v2.59.0-live | gzip > browserless-chromium-v2.59.0-live.tar.gz
+          ls -lh browserless-chromium-v2.59.0-live.tar.gz
+
+      - name: Upload archive to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view v2.59.0-live > /dev/null 2>&1 || \
+            gh release create v2.59.0-live --title "Live Shell Image" --notes "browserless-chromium image (docker load target) — built from v2.59.0-customize"
+          gh release upload v2.59.0-live browserless-chromium-v2.59.0-live.tar.gz --clobber
