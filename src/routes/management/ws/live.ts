@@ -169,7 +169,7 @@ export default class LiveNavWebSocketRoute extends WebSocketRoute {
         return client.send(JSON.stringify({ t: 'pong' }));
       }
       if (msg.t === 'watch' && typeof msg.targetId === 'string') {
-        return this.watch(state, msg.targetId, entry, logger);
+        return this.watch(state, msg.targetId, logger);
       }
       if (msg.t !== 'send' || !msg.m || typeof msg.m.method !== 'string') {
         return;
@@ -215,7 +215,6 @@ export default class LiveNavWebSocketRoute extends WebSocketRoute {
   private watch(
     state: ClientState,
     targetId: string,
-    entry: UpstreamEntry,
     logger: Logger,
   ): void {
     this.closeWatcher(state, logger);
