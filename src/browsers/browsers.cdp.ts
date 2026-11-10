@@ -449,6 +449,10 @@ export class ChromiumCDP extends EventEmitter {
 
     const finalOptions = {
       ...options,
+      // [LIVE-NAV PATCH] NAS-class hosts can take >30s for a cold Chromium
+      // first launch; puppeteer's default 30s launch timeout fails it. Make
+      // the window configurable instead of failing every cold start.
+      timeout: +(process.env.LAUNCH_TIMEOUT ?? '60000'),
       // Application shutdown owns these signals and awaits browser.close().
       // Puppeteer's handlers would kill Chrome before it flushes its profile.
       handleSIGTERM: false,
