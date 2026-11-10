@@ -10,30 +10,30 @@ import WebSocket, { WebSocketServer } from 'ws';
 /**
  * [LIVE-NAV PATCH] Live browser shell relay.
  *
- * A free-of-auth WebSocket relay that lets LAN devices open a browser-shell
- * UI (tab strip + URL bar + live screencast) against the *currently active*
- * browser instance. It is an observer: when sessions exist it attaches to the
- * newest one via the /devtools/browser/<GUID> reconnection endpoint (never
- * spawning a browser); only when no session is running does it spawn its own
- * instance through /chromium, whose lifecycle then follows the shell (last
- * client out + grace period closes the connection, which reclaims the
- * browser). It never touches session timers, killURLs or upstream state.
+ * Two-tier architecture (evidence-driven, see docs/aegis plans):
+ *  - ONE shared browser-level upstream (ws://127.0.0.1:<port>/chromium when
+ *    no session exists — shell owns that instance's lifecycle; or
+ *    /devtools/browser/<GUID> to attach an agent's session as observer).
+ *    Carries Target.* tab management: discovery, createTarget, closeTarget,
+ *    and target lifecycle events for the tab strip.
+ *  - PER-CLIENT page-level watcher (/devtools/page/<targetId>) for the tab
+ *    the client is watching: screencast frames, input, navigation. Chrome
+ *    headless REJECTS Page.startScreencast on flatten-attached sessions
+ *    ("Not attached to an active page"), so page-level connections are the
+ *    only working screencast path (same as the official debugger UI).
  *
- * Security posture: the channel is unauthenticated by design (LAN trust
- * boundary), so the downstream (browserbound) message set is strictly
- * whitelisted — anything that can execute JavaScript (Runtime.evaluate,
- * Page.*Script*, Debugger.*, etc.) is rejected before it reaches the wire.
- * Upstream events are relayed verbatim (screencast frames, target infos).
+ * Security: the channel is unauthenticated (LAN trust boundary), so every
+ * downstream method is whitelisted. Anything that can execute JS
+ * (Runtime.evaluate, Page.addScriptToEvaluateOnNewDocument, Debugger.*) is
+ * rejected before reaching the wire.
  */
 
 const BROWSER_METHODS = new Set<string>([
-  'Target.getTargets',
   'Target.setDiscoverTargets',
+  'Target.getTargets',
+  'Target.getTargetInfo',
   'Target.createTarget',
   'Target.closeTarget',
-  'Target.attachToTarget',
-  'Target.detachFromTarget',
-  'Target.getTargetInfo',
 ]);
 
 const PAGE_METHODS = new Set<string>([
@@ -62,21 +62,24 @@ const PAGE_METHODS = new Set<string>([
 // browser. Attached (agent-owned) instances are unaffected either way.
 const GRACE_MS = 30_000;
 
-interface ShellMessage {
-  t: 'send' | 'ping';
-  id?: string;
-  s?: string;
-  m?: { id?: number; method: string; params?: object };
+interface Watcher {
+  ws: WebSocket;
+  targetId: string;
+}
+
+interface ClientState {
+  ws: WebSocket;
+  watcher: Watcher | null;
 }
 
 interface UpstreamEntry {
   key: string;
   ws: WebSocket;
   spawned: boolean;
-  clients: Set<WebSocket>;
+  clients: Set<ClientState>;
   graceTimer: NodeJS.Timeout | null;
   seq: number;
-  replies: Map<number, { client: WebSocket; replyId?: string; s?: string }>;
+  replies: Map<number, { client: ClientState; replyId?: string }>;
   sendQueue: string[];
 }
 
@@ -117,7 +120,8 @@ export default class LiveNavWebSocketRoute extends WebSocketRoute {
       return;
     }
 
-    entry.clients.add(client);
+    const state: ClientState = { ws: client, watcher: null };
+    entry.clients.add(state);
     if (entry.graceTimer) {
       clearTimeout(entry.graceTimer);
       entry.graceTimer = null;
@@ -132,7 +136,8 @@ export default class LiveNavWebSocketRoute extends WebSocketRoute {
     );
 
     const dropClient = () => {
-      entry.clients.delete(client);
+      entry.clients.delete(state);
+      this.closeWatcher(state, logger);
       if (entry.clients.size === 0 && !entry.graceTimer) {
         entry.graceTimer = setTimeout(() => {
           entry.graceTimer = null;
@@ -149,52 +154,116 @@ export default class LiveNavWebSocketRoute extends WebSocketRoute {
     client.on('error', dropClient);
 
     client.on('message', (data: unknown) => {
-      let msg: ShellMessage;
+      let msg: {
+        t?: string;
+        id?: string;
+        targetId?: string;
+        m?: { method: string; params?: object };
+      };
       try {
-        msg = JSON.parse(String(data)) as ShellMessage;
+        msg = JSON.parse(String(data));
       } catch {
         return;
       }
       if (msg.t === 'ping') {
         return client.send(JSON.stringify({ t: 'pong' }));
       }
+      if (msg.t === 'watch' && typeof msg.targetId === 'string') {
+        return this.watch(state, msg.targetId, entry, logger);
+      }
       if (msg.t !== 'send' || !msg.m || typeof msg.m.method !== 'string') {
         return;
       }
       const { method } = msg.m;
-      const isPage = typeof msg.s === 'string' && msg.s.length > 0;
-      const allowed = isPage
-        ? PAGE_METHODS.has(method)
-        : BROWSER_METHODS.has(method);
-      if (!allowed) {
-        return client.send(
-          JSON.stringify({
-            t: 'error',
-            message: `Method not allowed on live-nav channel: ${method}`,
-          }),
+      if (BROWSER_METHODS.has(method)) {
+        const seq = ++entry.seq;
+        entry.replies.set(seq, { client: state, replyId: msg.id });
+        const payload = {
+          id: seq,
+          method,
+          params: msg.m.params ?? {},
+        };
+        if (entry.ws.readyState === WebSocket.OPEN) {
+          entry.ws.send(JSON.stringify(payload));
+        } else {
+          entry.sendQueue.push(JSON.stringify(payload));
+        }
+        return;
+      }
+      if (PAGE_METHODS.has(method)) {
+        if (!state.watcher || state.watcher.ws.readyState !== WebSocket.OPEN) {
+          return client.send(
+            JSON.stringify({
+              t: 'error',
+              message: 'No page is being watched — send {"t":"watch","targetId":"..."} first.',
+            }),
+          );
+        }
+        return state.watcher.ws.send(
+          JSON.stringify({ id: msg.id, method, params: msg.m.params ?? {} }),
         );
       }
-      const seq = ++entry.seq;
-      entry.replies.set(seq, {
-        client,
-        replyId: msg.id,
-        s: isPage ? msg.s : undefined,
-      });
-      const payload: Record<string, unknown> = {
-        id: seq,
-        method,
-        params: msg.m.params ?? {},
-      };
-      if (isPage) {
-        payload.sessionId = msg.s;
-      }
-      if (entry.ws.readyState === WebSocket.OPEN) {
-        entry.ws.send(JSON.stringify(payload));
-      } else {
-        // Upstream still connecting (spawn path): buffer and flush on open.
-        entry.sendQueue.push(JSON.stringify(payload));
+      return client.send(
+        JSON.stringify({
+          t: 'error',
+          message: `Method not allowed on live-nav channel: ${method}`,
+        }),
+      );
+    });
+  }
+
+  private watch(
+    state: ClientState,
+    targetId: string,
+    entry: UpstreamEntry,
+    logger: Logger,
+  ): void {
+    this.closeWatcher(state, logger);
+    const config = this.config();
+    const token = config.getToken();
+    const port = config.getPort();
+    const authQuery = token ? `?token=${token}` : '';
+    const url = `ws://127.0.0.1:${port}/devtools/page/${targetId}${authQuery}`;
+    const ws = new WebSocket(url, { maxPayload: 256 * 1024 * 1024 });
+    const watcher: Watcher = { ws, targetId };
+    state.watcher = watcher;
+
+    ws.on('open', () => {
+      logger.warn(`[live-nav] watcher open for ${targetId}`);
+      if (state.ws.readyState === WebSocket.OPEN) {
+        state.ws.send(JSON.stringify({ t: 'watching', targetId }));
       }
     });
+    ws.on('message', (data: unknown) => {
+      if (state.ws.readyState !== WebSocket.OPEN) return;
+      let parsed: { id?: unknown; method?: string; params?: object };
+      try {
+        parsed = JSON.parse(String(data));
+      } catch {
+        return;
+      }
+      // Page-level responses carry the client's own ids verbatim; events
+      // (screencast frames etc.) belong to this watcher only.
+      state.ws.send(JSON.stringify({ t: 'e', m: parsed }));
+    });
+    ws.on('close', () => {
+      if (state.watcher === watcher) state.watcher = null;
+      if (state.ws.readyState === WebSocket.OPEN) {
+        state.ws.send(JSON.stringify({ t: 'watchClosed', targetId }));
+      }
+    });
+    ws.on('error', (err) =>
+      logger.error(`[live-nav] watcher error: ${err}`),
+    );
+  }
+
+  private closeWatcher(state: ClientState, logger: Logger): void {
+    if (!state.watcher) return;
+    const w = state.watcher;
+    state.watcher = null;
+    if (w.ws.readyState === WebSocket.OPEN) w.ws.close(1000, 're-watch');
+    else w.ws.terminate();
+    logger.warn(`[live-nav] watcher closed for ${w.targetId}`);
   }
 
   protected async ensureUpstream(logger: Logger): Promise<UpstreamEntry> {
@@ -214,7 +283,6 @@ export default class LiveNavWebSocketRoute extends WebSocketRoute {
       const key = `${internal}/devtools/browser/${target.browserId}${authQuery}`;
       const existing = upstreams.get(key);
       if (existing && existing.ws.readyState === WebSocket.OPEN) {
-        logger.warn(`[live-nav] reusing attached upstream ${key}`);
         return existing;
       }
       logger.warn(`[live-nav] attaching to session ${target.browserId}`);
@@ -257,13 +325,13 @@ function makeUpstream(key: string, spawned: boolean, logger: Logger) {
     }
     entry.sendQueue = [];
     for (const c of entry.clients) {
-      c.send(JSON.stringify({ t: 'up', spawned, key }));
+      c.ws.send(JSON.stringify({ t: 'up', spawned, key }));
     }
   });
 
   ws.on('message', (data: unknown) => {
     let parsed: {
-      id?: number;
+      id?: unknown;
       method?: string;
       params?: object;
       sessionId?: string;
@@ -273,15 +341,14 @@ function makeUpstream(key: string, spawned: boolean, logger: Logger) {
     } catch {
       return;
     }
-    if (parsed.id !== undefined && entry.replies.has(parsed.id)) {
-      const { client, replyId, s } = entry.replies.get(parsed.id)!;
-      entry.replies.delete(parsed.id);
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(
+    if (parsed.id !== undefined && entry.replies.has(Number(parsed.id))) {
+      const { client, replyId } = entry.replies.get(Number(parsed.id))!;
+      entry.replies.delete(Number(parsed.id));
+      if (client.ws.readyState === WebSocket.OPEN) {
+        client.ws.send(
           JSON.stringify({
             t: 'r',
             id: replyId,
-            s,
             m: { id: parsed.id, result: (parsed as any).result, error: (parsed as any).error },
           }),
         );
@@ -291,12 +358,11 @@ function makeUpstream(key: string, spawned: boolean, logger: Logger) {
     if (parsed.method) {
       const frame = JSON.stringify({
         t: 'e',
-        s: parsed.sessionId,
         m: { method: parsed.method, params: parsed.params ?? {} },
       });
       for (const c of entry.clients) {
-        if (c.readyState === WebSocket.OPEN) {
-          c.send(frame);
+        if (c.ws.readyState === WebSocket.OPEN) {
+          c.ws.send(frame);
         }
       }
     }
@@ -305,9 +371,9 @@ function makeUpstream(key: string, spawned: boolean, logger: Logger) {
   ws.on('close', () => {
     logger.warn(`[live-nav] upstream closed: ${key}`);
     for (const c of entry.clients) {
-      if (c.readyState === WebSocket.OPEN) {
-        c.send(JSON.stringify({ t: 'upClosed' }));
-        c.close(1012, 'upstream-closed');
+      if (c.ws.readyState === WebSocket.OPEN) {
+        c.ws.send(JSON.stringify({ t: 'upClosed' }));
+        c.ws.close(1012, 'upstream-closed');
       }
     }
     upstreams.delete(key);

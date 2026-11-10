@@ -120,7 +120,7 @@ const PAGE_HTML = `<!doctype html>
 (function () {
   var ws = null, wsTimer = null;
   var targets = {};            // targetId -> {targetId,title,url,type,attached}
-  var sessions = {};           // targetId -> flatten sessionId
+  var watchTarget = null;      // targetId whose page-level channel is open
   var selected = null;
   var control = false;
   var spawned = null;          // null | true | false
@@ -144,11 +144,10 @@ const PAGE_HTML = `<!doctype html>
     elMsgText.textContent = t;
     elMsg.classList.toggle('hidden', !t);
   }
-  function send(method, params, sessionId) {
+  function send(method, params) {
     if (!ws || ws.readyState !== 1) return null;
     var id = 'c' + (seq++);
     var msg = { t: 'send', id: id, m: { method: method, params: params || {} } };
-    if (sessionId) msg.s = sessionId;
     try { ws.send(JSON.stringify(msg)); } catch (e) {}
     return id;
   }
@@ -161,7 +160,7 @@ const PAGE_HTML = `<!doctype html>
     catch (e) { wsTimer = setTimeout(connect, 2000); return; }
     ws.onopen = function () { setMsg(''); ensure(); };
     ws.onclose = function () {
-      sessions = {}; haveFrame = false;
+      targets = {}; watchTarget = null; haveFrame = false;
       setMsg('与浏览器的连接已断开，正在重连…');
       setState('已断开');
       wsTimer = setTimeout(connect, 2000);
@@ -172,8 +171,13 @@ const PAGE_HTML = `<!doctype html>
       if (d.t === 'up') {
         spawned = d.spawned;
         setState(spawned ? '已连接（独立实例）' : '已连接（旁观智能体实例）');
+      } else if (d.t === 'watching') {
+        watchTarget = d.targetId;
+        startCast();
+      } else if (d.t === 'watchClosed') {
+        if (watchTarget === d.targetId) { watchTarget = null; haveFrame = false; setMsg('该标签页已关闭'); }
       } else if (d.t === 'upClosed') {
-        sessions = {}; haveFrame = false; selected = null; renderTabs(); setMsg('浏览器会话已结束，正在重连…');
+        targets = {}; watchTarget = null; haveFrame = false; selected = null; renderTabs(); setMsg('浏览器会话已结束，正在重连…');
       } else if (d.t === 'error') {
         setMsg(String(d.message || '命令被拒绝'));
       } else if (d.t === 'r') {
@@ -186,46 +190,56 @@ const PAGE_HTML = `<!doctype html>
   }
 
   function ensure() {
+    // Initial state via pull (Target.getTargets), never via event replay —
+    // setDiscoverTargets is a no-op on an already-discovering upstream.
     send('Target.setDiscoverTargets', { discover: true });
-    send('Target.getTargets');
-  }
-
-  function attach(tid) {
-    if (!tid) return;
-    if (sessions[tid]) { startCast(sessions[tid]); return; }
-    var id = send('Target.attachToTarget', { targetId: tid, flatten: true });
+    var id = send('Target.getTargets');
     if (id) pending[id] = function (d) {
-      if (d.error) { setMsg('附加到标签页失败'); return; }
-      var sid = d.result && d.result.sessionId;
-      if (sid) { sessions[tid] = sid; if (tid === selected) startCast(sid); }
+      var infos = (d.result && d.result.targetInfos) || (d.result && d.result.targetIds ? d.result.targetIds.map(function (t) { return { targetId: t, type: 'unknown' }; }) : []);
+      infos.forEach(function (info) {
+        if (info.type === 'page' || info.type === 'unknown') {
+          if (!targets[info.targetId]) targets[info.targetId] = { targetId: info.targetId, type: info.type, url: info.url || '', title: info.title || '' };
+        }
+      });
+      renderTabs(); pickDefault(); syncUi();
+      if (selected) watch(selected);
     };
   }
 
   function onEvent(d) {
     var m = d.m || {};
-    if (m.method === 'Target.targetCreated' || m.method === 'Target.targetInfoChanged' || m.method === 'Target.targetDestroyed') {
-      var info = m.params.targetInfo;
-      if (m.method === 'Target.targetDestroyed') {
-        delete targets[info.targetId];
-        if (sessions[info.targetId]) delete sessions[info.targetId];
-        if (selected === info.targetId) { selected = null; haveFrame = false; }
-      } else if (info.type === 'page') {
-        targets[info.targetId] = info;
+    // Page-level watcher responses carry the client's own ids verbatim.
+    if (m.id !== undefined && pending[m.id]) {
+      var cb = pending[m.id];
+      delete pending[m.id];
+      cb({ result: m.result, error: m.error });
+      return;
+    }
+    var method = m.method || '';
+    if (method.indexOf('Target.') === 0) {
+      if (method === 'Target.targetCreated' || method === 'Target.targetInfoChanged' || method === 'Target.targetDestroyed') {
+        var info = m.params.targetInfo;
+        if (method === 'Target.targetDestroyed') {
+          delete targets[info.targetId];
+          if (selected === info.targetId) { selected = null; haveFrame = false; }
+        } else if (info.type === 'page') {
+          targets[info.targetId] = info;
+        }
+        if (selected && !targets[selected]) selected = null;
+        renderTabs();
+        if (!selected) pickDefault();
+        if (selected && watchTarget !== selected) watch(selected);
+        syncUi();
       }
-      if (selected && !targets[selected]) selected = null;
-      renderTabs();
-      if (!selected) pickDefault();
-      if (selected && !sessions[selected]) attach(selected);
-      syncUi();
       return;
     }
-    if (m.method === 'Page.screencastFrame' && d.s && d.s === sessions[selected]) {
+    if (method === 'Page.screencastFrame') {
       drawFrame(m.params);
-      send('Page.screencastFrameAck', { sessionId: m.params.metadata.frameId }, d.s);
+      send('Page.screencastFrameAck', { sessionId: m.params.metadata.frameId });
       return;
     }
-    if (m.method === 'Page.frameNavigated' && d.s === sessions[selected]) {
-      if (m.params.frame && !m.params.frame.parentId) {
+    if (method === 'Page.frameNavigated') {
+      if (m.params.frame && !m.params.frame.parentId && document.activeElement !== elUrl) {
         elUrl.value = m.params.frame.url || '';
       }
       return;
@@ -246,22 +260,22 @@ const PAGE_HTML = `<!doctype html>
     selected = (i >= 0 ? list[i] : list[0]).targetId;
   }
 
-  function attach(tid) {
-    if (!tid || sessions[tid]) { if (sessions[tid]) startCast(sessions[tid]); return; }
-    send('Target.attachToTarget', { targetId: tid, flatten: true });
+  function watch(tid) {
+    if (!tid || watchTarget === tid) return;
+    watchTarget = tid;
+    haveFrame = false;
+    ws.send(JSON.stringify({ t: 'watch', targetId: tid }));
+  }
+
+  function startCast() {
+    send('Page.enable', {});
+    send('Page.startScreencast', { format: 'jpeg', quality: 55, maxWidth: 1400, maxHeight: 1400, everyNthFrame: 1 });
   }
 
   function select(tid) {
-    if (selected && sessions[selected] && selected !== tid) {
-      send('Page.stopScreencast', {}, sessions[selected]);
-    }
-    selected = tid; haveFrame = false;
-    renderTabs(); syncUi(); attach(tid);
-  }
-
-  function startCast(sid) {
-    send('Page.enable', {}, sid);
-    send('Page.startScreencast', { format: 'jpeg', quality: 55, maxWidth: 1400, maxHeight: 1400, everyNthFrame: 1 }, sid);
+    selected = tid;
+    haveFrame = false;
+    renderTabs(); syncUi(); watch(tid);
   }
 
   function renderTabs() {
@@ -327,9 +341,8 @@ const PAGE_HTML = `<!doctype html>
 
   function input(method, params) {
     if (!control) return;
-    var sid = sessions[selected];
-    if (!sid) return;
-    send(method, params, sid);
+    if (!watchTarget) { setMsg('没有正在观看的标签页'); return; }
+    send(method, params);
   }
 
   elCanvas.addEventListener('mousedown', function (e) {
@@ -343,7 +356,7 @@ const PAGE_HTML = `<!doctype html>
   elCanvas.addEventListener('mousemove', function (e) {
     if (!control) return;
     var p = toDev(e);
-    send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: p.x, y: p.y, buttons: e.buttons || 0 }, sessions[selected]);
+    send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: p.x, y: p.y, buttons: e.buttons || 0 });
   });
   elCanvas.addEventListener('wheel', function (e) {
     var p = toDev(e);
@@ -363,7 +376,7 @@ const PAGE_HTML = `<!doctype html>
     var t = e.touches[0];
     if (Math.abs(t.clientX - touchStart.x) + Math.abs(t.clientY - touchStart.y) > 10) touchStart.moved = true;
     var p = toDev(t);
-    send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: p.x, y: p.y, buttons: 1 }, sessions[selected]);
+    send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: p.x, y: p.y, buttons: 1 });
     e.preventDefault();
   }, { passive: false });
   elCanvas.addEventListener('touchend', function (e) {
@@ -377,22 +390,22 @@ const PAGE_HTML = `<!doctype html>
   var KEYMAP = { Enter: 13, Backspace: 8, Tab: 9, Escape: 27, ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, Delete: 46 };
   document.addEventListener('keydown', function (e) {
     if (!control || document.activeElement === elUrl) return;
-    var sid = sessions[selected]; if (!sid) return;
+    if (!watchTarget) return;
     var printable = e.key.length === 1;
     var params = { type: 'keyDown', key: e.key, code: e.code };
     if (KEYMAP[e.key]) params.windowsVirtualKeyCode = params.nativeVirtualKeyCode = KEYMAP[e.key];
     if (printable) { params.text = e.key; params.unmodifiedText = e.key; }
     if (e.ctrlKey) params.modifiers = 2;
     if (e.metaKey) params.modifiers = 4;
-    send('Input.dispatchKeyEvent', params, sid);
+    send('Input.dispatchKeyEvent', params);
     if (KEYMAP[e.key] || e.key === 'Enter' || e.key === 'Backspace') e.preventDefault();
   });
   document.addEventListener('keyup', function (e) {
     if (!control || document.activeElement === elUrl) return;
-    var sid = sessions[selected]; if (!sid) return;
+    if (!watchTarget) return;
     var params = { type: 'keyUp', key: e.key, code: e.code };
     if (KEYMAP[e.key]) params.windowsVirtualKeyCode = params.nativeVirtualKeyCode = KEYMAP[e.key];
-    send('Input.dispatchKeyEvent', params, sid);
+    send('Input.dispatchKeyEvent', params);
   });
 
   elMode.onclick = function () {
@@ -406,9 +419,8 @@ const PAGE_HTML = `<!doctype html>
     var v = elUrl.value.trim();
     if (!v) return;
     if (!/^[a-z][a-z0-9+.-]*:\\/\\//i.test(v)) v = 'http://' + v;
-    var sid = sessions[selected];
-    if (!sid) { setMsg('没有选中标签页——先点 + 新建一个'); return; }
-    send('Page.navigate', { url: v }, sid);
+    if (!watchTarget) { setMsg('没有选中标签页——先点 + 新建一个'); return; }
+    send('Page.navigate', { url: v });
     elUrl.blur();
   });
 
